@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import ComingSoon from "@/components/shared/ComingSoon";
+import ContactSection from "@/components/contact/ContactSection";
 
 export const metadata: Metadata = {
   title: "Contact | NGM Conference 5.0",
@@ -8,10 +8,5 @@ export const metadata: Metadata = {
 };
 
 export default function ContactPage() {
-  return (
-    <ComingSoon
-      title="Contact"
-      description="Our contact page is being set up. In the meantime, reach out to us on our social media channels or email us at info@ngmplatform.com."
-    />
-  );
+  return <ContactSection />;
 }

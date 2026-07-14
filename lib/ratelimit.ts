@@ -20,6 +20,13 @@ export const uploadRatelimit = new Ratelimit({
   prefix: "ratelimit:upload",
 });
 
+export const contactRatelimit = new Ratelimit({
+  redis,
+  limiter: Ratelimit.slidingWindow(3, "1 m"),
+  analytics: true,
+  prefix: "ratelimit:contact",
+});
+
 export async function checkRateLimit(
   limiter: Ratelimit,
   identifier: string

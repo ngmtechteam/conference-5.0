@@ -12,6 +12,7 @@ import {
   step4Schema as smeStep4,
 } from "@/lib/schemas/sme-pitch";
 import { caseStudySchema } from "@/lib/schemas/case-study";
+import { contactSchema } from "@/lib/schemas/contact";
 
 export const dareNigeriaApplicationSchema = z.object({
   step1: dareStep1,
@@ -40,6 +41,10 @@ export function validateSMEPitchApplication(data: unknown) {
 
 export function validateCaseStudyApplication(data: unknown) {
   return caseStudySchema.safeParse(data);
+}
+
+export function validateContactMessage(data: unknown) {
+  return contactSchema.safeParse(data);
 }
 
 export interface ApplicationFiles {
