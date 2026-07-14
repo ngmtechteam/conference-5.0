@@ -3,86 +3,55 @@ import { db } from "@/lib/db";
 import { validateCaseStudyApplication } from "@/lib/validation";
 import { Competition } from "@/lib/generated/prisma/client";
 import { sendApplicationReceivedEmail } from "@/lib/email";
-import {
-  applicationRatelimit,
-  checkRateLimit,
-  getClientIp,
-} from "@/lib/ratelimit";
 import { apiLogger } from "@/lib/logger";
+import {
+  enforceApplicationRateLimit,
+  validationErrorResponse,
+  duplicateRegistrationResponse,
+} from "@/lib/api/applications";
+
+const COMPETITION_NAME = "Case Study & Research Analysis Competition";
+
+/**
+ * True when this email already has a Case Study application on file.
+ *
+ * The Case Study form stores email at the top level, while the other
+ * competitions nest it under step1.personalInfo.email — so we match both
+ * shapes to detect a registration made under any competition.
+ */
+async function hasExistingCaseStudyRegistration(
+  email: string,
+): Promise<boolean> {
+  const existing = await db.application.findFirst({
+    where: {
+      OR: [
+        { data: { path: ["email"], equals: email } },
+        { data: { path: ["step1", "personalInfo", "email"], equals: email } },
+      ],
+    },
+    select: { id: true, competition: true },
+  });
+
+  return existing?.competition === Competition.CASE_STUDY;
+}
 
 export async function POST(request: Request) {
   try {
-    const ip = getClientIp(request);
-    const { success: rateLimitOk } = await checkRateLimit(
-      applicationRatelimit,
-      ip,
-    );
+    const rateLimited = await enforceApplicationRateLimit(request);
+    if (rateLimited) return rateLimited;
 
-    if (!rateLimitOk) {
-      return NextResponse.json(
-        { error: "Too many requests. Please try again later." },
-        { status: 429 },
-      );
-    }
-
-    const body = await request.json();
-    const { formData } = body;
+    const { formData } = await request.json();
 
     const validation = validateCaseStudyApplication(formData);
-
     if (!validation.success) {
-      return NextResponse.json(
-        {
-          error: "Validation failed",
-          details: validation.error.flatten(),
-        },
-        { status: 400 },
-      );
+      return validationErrorResponse(validation.error);
     }
 
     const applicantEmail = validation.data.email;
     const applicantName = validation.data.fullName;
 
-    // Case Study form stores email at the top level; the other competitions
-    // nest it under step1.personalInfo.email. Check both shapes so a person
-    // who has registered for any competition is detected.
-    const existingApplication = await db.application.findFirst({
-      where: {
-        OR: [
-          {
-            data: {
-              path: ["email"],
-              equals: applicantEmail,
-            },
-          },
-          {
-            data: {
-              path: ["step1", "personalInfo", "email"],
-              equals: applicantEmail,
-            },
-          },
-        ],
-      },
-      select: { id: true, competition: true },
-    });
-
-    if (
-      existingApplication &&
-      existingApplication.competition === Competition.CASE_STUDY
-    ) {
-      // const competitionName =
-      //   existingApplication.competition === Competition.DARE_NIGERIA
-      //     ? "DARE Nigeria Challenge"
-      //     : existingApplication.competition === Competition.SME_PITCH
-      //       ? "SME Pitch Competition"
-      //       : "Case Study & Research Analysis Competition";
-      const competitionName = "Case Study & Research Analysis Competition";
-      return NextResponse.json(
-        {
-          error: `You have already registered for the ${competitionName}. Each participant can only register for one competition.`,
-        },
-        { status: 409 },
-      );
+    if (await hasExistingCaseStudyRegistration(applicantEmail)) {
+      return duplicateRegistrationResponse(COMPETITION_NAME);
     }
 
     const application = await db.application.create({
@@ -92,11 +61,11 @@ export async function POST(request: Request) {
       },
     });
 
-    await sendApplicationReceivedEmail(
-      applicantEmail,
+    await sendApplicationReceivedEmail({
+      to: applicantEmail,
       applicantName,
-      "case_study",
-    );
+      competition: "case_study",
+    });
 
     apiLogger.info(
       { applicationId: application.id, competition: "CASE_STUDY" },

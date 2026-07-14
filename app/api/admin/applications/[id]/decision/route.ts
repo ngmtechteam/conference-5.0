@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getToken } from "next-auth/jwt";
 import { db } from "@/lib/db";
-import { ApplicationStatus } from "@/lib/generated/prisma/client";
+import { ApplicationStatus, type Application } from "@/lib/generated/prisma/client";
 import {
   Competition,
   sendApplicationAcceptedEmail,
@@ -13,38 +13,106 @@ interface RouteParams {
   params: Promise<{ id: string }>;
 }
 
+type Decision = "accept" | "decline";
+
 const COMPETITION_NAMES: Record<string, Competition> = {
   DARE_NIGERIA: "dare_nigeria",
   SME_PITCH: "sme_pitch",
   CASE_STUDY: "case_study",
 };
 
+/** Applicant contact details, normalised across the different data shapes. */
+interface Applicant {
+  email?: string;
+  name: string;
+}
+
+/** Multi-step competitions (DARE, SME) nest the applicant under step1. */
+interface MultiStepApplicationData {
+  step1?: {
+    personalInfo?: {
+      firstName?: string;
+      lastName?: string;
+      email?: string;
+    };
+  };
+}
+
+/** The case study competition stores the applicant at the top level. */
+interface CaseStudyApplicationData {
+  fullName?: string;
+  email?: string;
+}
+
+function isValidDecision(value: unknown): value is Decision {
+  return value === "accept" || value === "decline";
+}
+
+function isAlreadyDecided(status: ApplicationStatus): boolean {
+  return (
+    status === ApplicationStatus.ACCEPTED ||
+    status === ApplicationStatus.DECLINED
+  );
+}
+
+function decisionToStatus(decision: Decision): ApplicationStatus {
+  return decision === "accept"
+    ? ApplicationStatus.ACCEPTED
+    : ApplicationStatus.DECLINED;
+}
+
+async function getAdminId(request: Request): Promise<string> {
+  const token = await getToken({
+    req: request,
+    secret: process.env.NEXTAUTH_SECRET,
+  });
+  return token?.id as string;
+}
+
+/** Maps the stored (uppercase) competition onto the email module's naming. */
+function resolveCompetition(competition: string): Competition {
+  return COMPETITION_NAMES[competition] || (competition as Competition);
+}
+
+/** Applicant contact details live in a different shape per competition. */
+function extractApplicant(application: Application): Applicant {
+  if (application.competition === "CASE_STUDY") {
+    const data = application.data as unknown as CaseStudyApplicationData;
+    return { email: data.email, name: data.fullName ?? "" };
+  }
+
+  const info = (application.data as unknown as MultiStepApplicationData).step1
+    ?.personalInfo;
+  const name = `${info?.firstName ?? ""} ${info?.lastName ?? ""}`.trim();
+  return { email: info?.email, name };
+}
+
+function sendDecisionEmail(
+  decision: Decision,
+  params: { to: string; applicantName: string; competition: Competition },
+) {
+  const send =
+    decision === "accept"
+      ? sendApplicationAcceptedEmail
+      : sendApplicationDeclinedEmail;
+  return send(params);
+}
+
 export async function POST(request: Request, { params }: RouteParams) {
   try {
     const { id } = await params;
-    const body = await request.json();
-    const { decision, notes } = body;
+    const { decision, notes } = await request.json();
 
-    // Validate decision
-    if (!["accept", "decline"].includes(decision)) {
+    if (!isValidDecision(decision)) {
       return NextResponse.json(
         { error: "Invalid decision. Must be 'accept' or 'decline'" },
         { status: 400 },
       );
     }
 
-    // Get current admin from token
-    const token = await getToken({
-      req: request,
-      secret: process.env.NEXTAUTH_SECRET,
-    });
+    const adminId = await getAdminId(request);
 
-    const adminId = token?.id as string;
-
-    // Get application
-    const application = await db.application.findUnique({
-      where: { id },
-    });
+    const application = await db.application.findUnique({ where: { id } });
 
     if (!application) {
       return NextResponse.json(
@@ -53,73 +121,31 @@ export async function POST(request: Request, { params }: RouteParams) {
       );
     }
 
-    // Check if already decided
-    if (
-      application.status === ApplicationStatus.ACCEPTED ||
-      application.status === ApplicationStatus.DECLINED
-    ) {
+    if (isAlreadyDecided(application.status)) {
       return NextResponse.json(
         { error: "Application has already been decided" },
         { status: 400 },
       );
     }
 
-    // Update application status
-    const newStatus =
-      decision === "accept"
-        ? ApplicationStatus.ACCEPTED
-        : ApplicationStatus.DECLINED;
-
     const updatedApplication = await db.application.update({
       where: { id },
       data: {
-        status: newStatus,
+        status: decisionToStatus(decision),
         adminNotes: notes || application.adminNotes,
         decidedAt: new Date(),
         decidedBy: adminId,
       },
     });
 
-    // Extract applicant info for email
-    const data = application.data as {
-      step1?: {
-        personalInfo?: {
-          firstName?: string;
-          lastName?: string;
-          email?: string;
-        };
-      };
-    };
+    const applicant = extractApplicant(application);
 
-    const applicantEmail =
-      updatedApplication.competition === "CASE_STUDY"
-        ? (updatedApplication.data as any).email
-        : data?.step1?.personalInfo?.email;
-    const applicantName =
-      updatedApplication.competition === "CASE_STUDY"
-        ? (updatedApplication.data as any).fullName
-        : `${data?.step1?.personalInfo?.firstName || ""} ${data?.step1?.personalInfo?.lastName || ""}`.trim();
-
-    const competitionName =
-      COMPETITION_NAMES[application.competition] || application.competition;
-
-    // Send email notification
-    if (applicantEmail) {
-      if (decision === "accept") {
-        await sendApplicationAcceptedEmail(
-          applicantEmail,
-          applicantName,
-          competitionName,
-          notes,
-        );
-      } else {
-        await sendApplicationDeclinedEmail(
-          applicantEmail,
-          applicantName,
-          competitionName,
-          notes,
-        );
-      }
+    if (applicant.email) {
+      await sendDecisionEmail(decision, {
+        to: applicant.email,
+        applicantName: applicant.name,
+        competition: resolveCompetition(application.competition),
+      });
     }
 
     apiLogger.info(
@@ -135,7 +161,7 @@ export async function POST(request: Request, { params }: RouteParams) {
     return NextResponse.json({
       success: true,
       application: updatedApplication,
-      emailSent: !!applicantEmail,
+      emailSent: !!applicant.email,
     });
   } catch (error) {
     apiLogger.error({ error }, "Admin decision error");

@@ -1,38 +1,57 @@
-import { Resend } from "resend";
+import { Resend, type CreateEmailOptions } from "resend";
 import fs from "fs";
 import path from "path";
 import { emailLogger } from "@/lib/logger";
 
 export type Competition = "dare_nigeria" | "sme_pitch" | "case_study";
 
-const getCompetionName = (competition: Competition) => {
-  switch (competition) {
-    case "dare_nigeria":
-      return "DARE Nigeria Challenge";
-    case "sme_pitch":
-      return "SME Pitch Competition";
-    case "case_study":
-      return "Case Study & Research Analysis Competition";
-    default:
-      return "";
-  }
+const COMPETITION_NAMES: Record<Competition, string> = {
+  dare_nigeria: "DARE Nigeria Challenge",
+  sme_pitch: "SME Pitch Competition",
+  case_study: "Case Study & Research Analysis Competition",
 };
 
-const resend = new Resend(process.env.RESEND_API_KEY);
+const DEFAULT_COMPETITION_URL = "https://conference.ngmplatform.com";
+
+// Lazily instantiate Resend so a missing RESEND_API_KEY surfaces as a caught
+// error inside each handler (returned as JSON) rather than crashing the whole
+// route module at import time (which makes Next.js serve an HTML error page).
+let resendClient: Resend | null = null;
+
+function getResend(): Resend {
+  if (!resendClient) {
+    resendClient = new Resend(process.env.RESEND_API_KEY);
+  }
+  return resendClient;
+}
 
 const FROM_EMAIL =
   process.env.RESEND_FROM_EMAIL || "NGM Conference 5.0 <info@ngmplatform.com>";
 
+const CONTACT_RECIPIENT_EMAIL =
+  process.env.CONTACT_RECIPIENT_EMAIL || "info@ngmplatform.com";
+
+export type EmailResult = { success: true } | { success: false; error: unknown };
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
 function loadTemplate(
   templateName: string,
-  competitionType: Competition,
+  competition: Competition,
   variables: Record<string, string>,
 ): string {
   const templatePath = path.join(
     process.cwd(),
     "emails",
     "html",
-    competitionType,
+    competition,
     `${templateName}.html`,
   );
   let html = fs.readFileSync(templatePath, "utf-8");
@@ -42,124 +61,156 @@ function loadTemplate(
   return html;
 }
 
-export async function sendApplicationReceivedEmail(
-  to: string,
-  applicantName: string,
-  competitionType: Competition,
-  competitionUrl?: string,
-) {
+/**
+ * Single place where an email is actually sent. Owns the send call, the
+ * success/failure logging and the try/catch so the callers above stay
+ * declarative and free of duplicated boilerplate.
+ */
+async function dispatchEmail(
+  message: CreateEmailOptions,
+  log: {
+    context: Record<string, unknown>;
+    failureMessage: string;
+    successMessage: string;
+  },
+): Promise<EmailResult> {
   try {
-    const competition = getCompetionName(competitionType);
-    const html = loadTemplate("received", competitionType, {
-      first_name: applicantName,
-      competition_name: competition,
-      competition_url: competitionUrl || "https://conference.ngmplatform.com",
-    });
-
-    const { error } = await resend.emails.send({
-      from: FROM_EMAIL,
-      to,
-      subject: `Application Received - ${competition}`,
-      html,
-    });
+    const { error } = await getResend().emails.send(message);
 
     if (error) {
-      emailLogger.error(
-        { error, to, type: "received" },
-        "Failed to send 'Application Received' email",
-      );
+      emailLogger.error({ error, ...log.context }, log.failureMessage);
       return { success: false, error };
     }
 
-    emailLogger.info(
-      { to, competition, type: "received" },
-      "'Application Received' email sent",
-    );
+    emailLogger.info(log.context, log.successMessage);
     return { success: true };
   } catch (error) {
-    emailLogger.error({ error, to, type: "received" }, "Email send error");
+    emailLogger.error({ error, ...log.context }, "Email send error");
     return { success: false, error };
   }
 }
 
-export async function sendApplicationAcceptedEmail(
-  to: string,
-  applicantName: string,
-  competitionType: Competition,
-  additionalInfo?: string,
-  competitionUrl?: string,
-) {
-  try {
-    const competition = getCompetionName(competitionType);
-    const html = loadTemplate("accepted", competitionType, {
-      first_name: applicantName,
-      competition_name: competition,
-      competition_url: competitionUrl || "https://conference.ngmplatform.com",
-    });
+/**
+ * The three applicant-facing lifecycle emails share the same template pipeline
+ * and differ only by subject line and log copy, captured here as data.
+ */
+type ApplicationEmailKind = "received" | "accepted" | "declined";
 
-    const { error } = await resend.emails.send({
-      from: FROM_EMAIL,
-      to,
-      subject: `Congratulations! Your ${competition} Application Has Been Accepted`,
-      html,
-    });
-
-    if (error) {
-      emailLogger.error(
-        { error, to, type: "accepted" },
-        "Failed to send acceptance email",
-      );
-      return { success: false, error };
-    }
-
-    emailLogger.info(
-      { to, competition, type: "accepted" },
-      "'Application Accepted' email sent",
-    );
-    return { success: true };
-  } catch (error) {
-    emailLogger.error({ error, to, type: "accepted" }, "Email send error");
-    return { success: false, error };
+const APPLICATION_EMAILS: Record<
+  ApplicationEmailKind,
+  {
+    subject: (competitionName: string) => string;
+    failureMessage: string;
+    successMessage: string;
   }
+> = {
+  received: {
+    subject: (name) => `Application Received - ${name}`,
+    failureMessage: "Failed to send 'Application Received' email",
+    successMessage: "'Application Received' email sent",
+  },
+  accepted: {
+    subject: (name) =>
+      `Congratulations! Your ${name} Application Has Been Accepted`,
+    failureMessage: "Failed to send acceptance email",
+    successMessage: "'Application Accepted' email sent",
+  },
+  declined: {
+    subject: (name) => `Update on Your ${name} Application`,
+    failureMessage: "Failed to send decline email",
+    successMessage: "'Application Declined' email sent",
+  },
+};
+
+export interface ApplicationEmailParams {
+  to: string;
+  applicantName: string;
+  competition: Competition;
+  competitionUrl?: string;
 }
 
-export async function sendApplicationDeclinedEmail(
-  to: string,
-  applicantName: string,
-  competitionType: Competition,
-  reason?: string,
-  competitionUrl?: string,
-) {
-  try {
-    const competition = getCompetionName(competitionType);
-    const html = loadTemplate("declined", competitionType, {
-      first_name: applicantName,
-      competition_name: competition,
-      competition_url: competitionUrl || "https://conference.ngmplatform.com",
-    });
+async function sendApplicationEmail(
+  kind: ApplicationEmailKind,
+  { to, applicantName, competition, competitionUrl }: ApplicationEmailParams,
+): Promise<EmailResult> {
+  const config = APPLICATION_EMAILS[kind];
+  const competitionName = COMPETITION_NAMES[competition];
 
-    const { error } = await resend.emails.send({
+  const html = loadTemplate(kind, competition, {
+    first_name: applicantName,
+    competition_name: competitionName,
+    competition_url: competitionUrl || DEFAULT_COMPETITION_URL,
+  });
+
+  return dispatchEmail(
+    {
       from: FROM_EMAIL,
       to,
-      subject: `Update on Your ${competition} Application`,
+      subject: config.subject(competitionName),
       html,
-    });
+    },
+    {
+      context: { to, competition: competitionName, type: kind },
+      failureMessage: config.failureMessage,
+      successMessage: config.successMessage,
+    },
+  );
+}
 
-    if (error) {
-      emailLogger.error(
-        { error, to, type: "declined" },
-        "Failed to send decline email",
-      );
-      return { success: false, error };
-    }
+export function sendApplicationReceivedEmail(params: ApplicationEmailParams) {
+  return sendApplicationEmail("received", params);
+}
 
-    emailLogger.info(
-      { to, competition, type: "declined" },
-      "'Application Declined' email sent",
-    );
-    return { success: true };
-  } catch (error) {
-    emailLogger.error({ error, to, type: "declined" }, "Email send error");
-    return { success: false, error };
-  }
+export function sendApplicationAcceptedEmail(params: ApplicationEmailParams) {
+  return sendApplicationEmail("accepted", params);
+}
+
+export function sendApplicationDeclinedEmail(params: ApplicationEmailParams) {
+  return sendApplicationEmail("declined", params);
+}
+
+export interface ContactMessageParams {
+  name: string;
+  email: string;
+  subject: string;
+  message: string;
+}
+
+function renderContactMessageHtml({
+  name,
+  email,
+  subject,
+  message,
+}: ContactMessageParams): string {
+  return `
+      <div style="font-family: Arial, sans-serif; color: #171717; line-height: 1.6;">
+        <h2 style="color: #0f1990; margin-bottom: 16px;">New Contact Message</h2>
+        <p><strong>Name:</strong> ${escapeHtml(name)}</p>
+        <p><strong>Email:</strong> ${escapeHtml(email)}</p>
+        <p><strong>Subject:</strong> ${escapeHtml(subject)}</p>
+        <p style="margin-top: 16px;"><strong>Message:</strong></p>
+        <p style="white-space: pre-wrap; padding: 12px 16px; background: #f5f5f5; border-radius: 8px;">${escapeHtml(
+          message,
+        )}</p>
+      </div>
+    `;
+}
+
+export function sendContactMessageEmail(
+  params: ContactMessageParams,
+): Promise<EmailResult> {
+  return dispatchEmail(
+    {
+      from: FROM_EMAIL,
+      to: CONTACT_RECIPIENT_EMAIL,
+      replyTo: params.email,
+      subject: `New contact message: ${params.subject}`,
+      html: renderContactMessageHtml(params),
+    },
+    {
+      context: { from: params.email, type: "contact" },
+      failureMessage: "Failed to send contact message email",
+      successMessage: "Contact message email sent",
+    },
+  );
 }

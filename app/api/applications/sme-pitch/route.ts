@@ -3,74 +3,49 @@ import { db } from "@/lib/db";
 import { validateSMEPitchApplication } from "@/lib/validation";
 import { Competition } from "@/lib/generated/prisma/client";
 import { sendApplicationReceivedEmail } from "@/lib/email";
-import {
-  applicationRatelimit,
-  checkRateLimit,
-  getClientIp,
-} from "@/lib/ratelimit";
 import { apiLogger } from "@/lib/logger";
+import {
+  enforceApplicationRateLimit,
+  validationErrorResponse,
+  duplicateRegistrationResponse,
+} from "@/lib/api/applications";
+
+/** Finds any existing application registered under this email (DARE or SME). */
+async function findExistingRegistration(email: string) {
+  return db.application.findFirst({
+    where: {
+      data: { path: ["step1", "personalInfo", "email"], equals: email },
+    },
+    select: { id: true, competition: true },
+  });
+}
 
 export async function POST(request: Request) {
   try {
-    // Rate limiting
-    const ip = getClientIp(request);
-    const { success: rateLimitOk } = await checkRateLimit(
-      applicationRatelimit,
-      ip,
-    );
+    const rateLimited = await enforceApplicationRateLimit(request);
+    if (rateLimited) return rateLimited;
 
-    if (!rateLimitOk) {
-      return NextResponse.json(
-        { error: "Too many requests. Please try again later." },
-        { status: 429 },
-      );
-    }
+    const { formData } = await request.json();
 
-    const body = await request.json();
-    const { formData } = body;
-
-    // Validate form data
     const validation = validateSMEPitchApplication(formData);
-
     if (!validation.success) {
-      return NextResponse.json(
-        {
-          error: "Validation failed",
-          details: validation.error.flatten(),
-        },
-        { status: 400 },
-      );
+      return validationErrorResponse(validation.error);
     }
 
-    // Extract email for confirmation
-    const applicantEmail = validation.data.step1.personalInfo.email;
-    const applicantName = `${validation.data.step1.personalInfo.firstName} ${validation.data.step1.personalInfo.lastName}`;
+    const { personalInfo } = validation.data.step1;
+    const applicantEmail = personalInfo.email;
+    const applicantName = `${personalInfo.firstName} ${personalInfo.lastName}`;
 
-    // Check if the user has already registered for any competition
-    const existingApplication = await db.application.findFirst({
-      where: {
-        data: {
-          path: ["step1", "personalInfo", "email"],
-          equals: applicantEmail,
-        },
-      },
-      select: { id: true, competition: true },
-    });
-
-    if (existingApplication) {
+    // SME Pitch blocks anyone already registered for another competition.
+    const existing = await findExistingRegistration(applicantEmail);
+    if (existing) {
       const competitionName =
-        existingApplication.competition === Competition.DARE_NIGERIA
+        existing.competition === Competition.DARE_NIGERIA
           ? "DARE Nigeria Challenge"
           : "SME Pitch Competition";
-      return NextResponse.json(
-        {
-          error: `You have already registered for the ${competitionName}. Each participant can only register for one competition.`,
-        },
-        { status: 409 },
-      );
+      return duplicateRegistrationResponse(competitionName);
     }
 
-    // Create application record
     const application = await db.application.create({
       data: {
         competition: Competition.SME_PITCH,
@@ -78,12 +53,11 @@ export async function POST(request: Request) {
       },
     });
 
-    // Send confirmation email
-    await sendApplicationReceivedEmail(
-      applicantEmail,
+    await sendApplicationReceivedEmail({
+      to: applicantEmail,
       applicantName,
-      "sme_pitch",
-    );
+      competition: "sme_pitch",
+    });
 
     apiLogger.info(
       { applicationId: application.id, competition: "SME_PITCH" },
